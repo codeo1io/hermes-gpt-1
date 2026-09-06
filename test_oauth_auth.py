@@ -328,14 +328,16 @@ def test_token_endpoint_stops_reading_chunked_body_at_limit(oauth_state: OAuthSt
 
 def test_authorization_code_exchange_preserves_legacy_chatgpt_request_shape(oauth_client: TestClient):
     """The ChatGPT connector's legacy request shape (openid scope, no
-    offline_access) still works — now always with mandatory PKCE."""
+    offline_access) still works — now always with mandatory PKCE, and
+    (2026-09-06 outage fix) ALWAYS with a refresh token so an evicted
+    credential can self-heal instead of 401-looping forever."""
     code = authorize_code(oauth_client, scope="openid hermes")
     response = exchange_code(oauth_client, code, code_verifier=DEFAULT_VERIFIER)
     assert response.status_code == 200
     body = response.json()
     assert body["expires_in"] == ACCESS_TOKEN_TTL_SECONDS
     assert body["scope"] == "openid hermes"
-    assert "refresh_token" not in body
+    assert body["refresh_token"]
 
 
 def test_authorize_without_pkce_challenge_is_rejected(oauth_client: TestClient):

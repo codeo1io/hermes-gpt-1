@@ -2654,6 +2654,9 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
         async def token(request: Request) -> JSONResponse:
             return await oauth_auth.token(request, oauth_state)
 
+        async def register_client(request: Request) -> JSONResponse:
+            return await oauth_auth.register_client(request, oauth_state)
+
         routes.extend(
             [
                 Route("/.well-known/oauth-protected-resource", resource_metadata, methods=["GET"]),
@@ -2661,6 +2664,7 @@ def build_asgi_app(server: FastMCP, *, http: bool) -> Any:
                 Route("/.well-known/oauth-authorization-server", authorization_server_metadata, methods=["GET"]),
                 Route("/oauth/authorize", authorize, methods=["GET"]),
                 Route("/oauth/token", token, methods=["POST"]),
+                Route("/oauth/register", register_client, methods=["POST"]),
             ]
         )
     # Mount browser UI routes before the MCP catch-all. The UI remains opt-in

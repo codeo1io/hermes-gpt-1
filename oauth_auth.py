@@ -78,6 +78,20 @@ def _base64url_decode(value: str) -> bytes:
     return decoded
 
 
+#: Hosts dynamic clients may redirect to (RFC 7591 allowlist). The redirect
+#: allowlist is the load-bearing control: dynamic clients are public (PKCE
+#: only, no secret), so the redirect_uri is the only party-binding we get.
+_DYNAMIC_CLIENT_REDIRECT_HOSTS = frozenset(
+    {"chatgpt.com", "chat.openai.com", "openai.com"}
+)
+
+#: Registration endpoint body bound (RFC 7591 payloads are small).
+_MAX_REGISTER_BYTES = 8 * 1024
+
+#: Bounded dynamic-client registry (single-tenant issuer).
+MAX_DYNAMIC_CLIENTS = 64
+
+
 class OAuthError(RuntimeError):
     def __init__(self, error: str, description: str, *, status_code: int = 400) -> None:
         super().__init__(description)
@@ -160,6 +174,43 @@ class OAuthConfig:
         return tuple(dict.fromkeys((self.scope, "openid", "offline_access")))
 
 
+@dataclass(frozen=True)
+class DynamicClient:
+    """A dynamically registered public OAuth client (RFC 7591).
+
+    Public client: PKCE only, no secret. The redirect allowlist is the
+    party-binding control (chatgpt.com family only).
+    """
+
+    client_id: str
+    redirect_uris: tuple[str, ...]
+    registered_at: float
+
+    def as_public_dict(self) -> dict[str, Any]:
+        return {
+            "client_id": self.client_id,
+            "client_id_issued_at": int(self.registered_at),
+            "redirect_uris": list(self.redirect_uris),
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+        }
+
+
+def _registerable_redirect(redirect_uri: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(redirect_uri)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and host in _DYNAMIC_CLIENT_REDIRECT_HOSTS
+        and not parsed.fragment
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
 class OAuthState:
     def __init__(
         self,
@@ -168,15 +219,91 @@ class OAuthState:
         max_auth_codes: int = MAX_AUTH_CODES,
         max_access_tokens: int = MAX_ACCESS_TOKENS,
         max_refresh_tokens: int = MAX_REFRESH_TOKENS,
+        max_dynamic_clients: int = MAX_DYNAMIC_CLIENTS,
     ) -> None:
         self.config = config
         self.max_auth_codes = max_auth_codes
         self.max_access_tokens = max_access_tokens
         self.max_refresh_tokens = max_refresh_tokens
+        self.max_dynamic_clients = max_dynamic_clients
         self._authorization_code_key = secrets.token_bytes(32)
         self.used_auth_codes: dict[str, dict[str, Any]] = {}
         self.access_tokens: dict[str, dict[str, Any]] = {}
         self.refresh_tokens: dict[str, dict[str, Any]] = {}
+        self.dynamic_clients: dict[str, DynamicClient] = {}
+
+    def register_dynamic_client(self, redirect_uris: list[str]) -> DynamicClient:
+        """Mint a public dynamic client; bounded, chatgpt.com-redirects only."""
+        cleaned = list(dict.fromkeys(redirect_uris))
+        if not cleaned or len(cleaned) > 8:
+            raise OAuthError(
+                "invalid_client_metadata",
+                "Between 1 and 8 redirect_uris are required.",
+            )
+        for redirect_uri in cleaned:
+            if not isinstance(redirect_uri, str) or not _registerable_redirect(redirect_uri):
+                raise OAuthError(
+                    "invalid_redirect_uri",
+                    "redirect_uris must be absolute HTTPS URLs on chatgpt.com/openai.com hosts.",
+                )
+        if len(self.dynamic_clients) >= self.max_dynamic_clients:
+            raise OAuthError(
+                "temporarily_unavailable",
+                "Dynamic client capacity is temporarily unavailable.",
+                status_code=429,
+            )
+        client_id = f"dyn-{secrets.token_urlsafe(12)}"
+        client = DynamicClient(
+            client_id=client_id,
+            redirect_uris=tuple(cleaned),
+            registered_at=time.time(),
+        )
+        self.dynamic_clients[client_id] = client
+        return client
+
+    def client_redirect_allowed(self, client_id: str, redirect_uri: str) -> bool:
+        """Redirect check for dynamic clients (exact-match against their
+        registered URIs; the static config path keeps its own rules)."""
+        client = self.dynamic_clients.get(client_id)
+        if client is None:
+            return False
+        return redirect_uri in client.redirect_uris
+
+    def is_dynamic_client(self, client_id: str) -> bool:
+        return client_id in self.dynamic_clients
+
+    def export_dynamic_clients(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "client_id": c.client_id,
+                "redirect_uris": list(c.redirect_uris),
+                "registered_at": c.registered_at,
+            }
+            for c in self.dynamic_clients.values()
+        ]
+
+    def import_dynamic_clients(self, payload: Any) -> int:
+        if not isinstance(payload, list):
+            return 0
+        imported = 0
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            client_id = item.get("client_id")
+            redirects = item.get("redirect_uris")
+            registered_at = item.get("registered_at", 0)
+            if not isinstance(client_id, str) or not isinstance(redirects, list):
+                continue
+            if len(self.dynamic_clients) >= self.max_dynamic_clients:
+                break
+            self.dynamic_clients[client_id] = DynamicClient(
+                client_id=client_id,
+                redirect_uris=tuple(str(u) for u in redirects),
+                registered_at=float(registered_at or 0),
+            )
+            imported += 1
+        return imported
+
 
     def cleanup(self) -> None:
         now = time.time()
@@ -314,8 +441,7 @@ class OAuthState:
         scope = self.normalize_scope(item["scope"])
         self._require_capacity(self.used_auth_codes, self.max_auth_codes, "Authorization-code replay cache")
         self._require_capacity(self.access_tokens, self.max_access_tokens, "Access-token")
-        if "offline_access" in scope.split():
-            self._require_capacity(self.refresh_tokens, self.max_refresh_tokens, "Refresh-token")
+        self._require_capacity(self.refresh_tokens, self.max_refresh_tokens, "Refresh-token")
 
         access_value, access_item = self._new_access_token(
             client_id=client_id,
@@ -328,16 +454,19 @@ class OAuthState:
             "expires_in": ACCESS_TOKEN_TTL_SECONDS,
             "scope": scope,
         }
-        refresh_value = ""
-        refresh_item: dict[str, Any] | None = None
-        if "offline_access" in scope.split():
-            refresh_value, refresh_item = self._new_refresh_token(client_id=client_id, scope=scope)
-            response["refresh_token"] = refresh_value
+        # 2026-09-06 outage fix: EVERY code exchange now issues a refresh
+        # token. The connector's scheme flow authorizes scope=hermes (no
+        # offline_access), so its credential could never self-heal after a
+        # client-side eviction — the connector then 401-loops forever.
+        # Refresh tokens are bound to the client and rotated on every use;
+        # issuing one unconditionally cannot escalate scope (a narrowed
+        # refresh request is still subset-checked at exchange time).
+        refresh_value, refresh_item = self._new_refresh_token(client_id=client_id, scope=scope)
+        response["refresh_token"] = refresh_value
 
         self.used_auth_codes[nonce] = {"expires_at": item["expires_at"]}
         self.access_tokens[access_value] = access_item
-        if refresh_item is not None:
-            self.refresh_tokens[refresh_value] = refresh_item
+        self.refresh_tokens[refresh_value] = refresh_item
         _run_persist_hook(self, "authorization_code")
         return response
 
@@ -407,6 +536,7 @@ class OAuthState:
                 for value, item in store.items()
                 if item.get("expires_at", 0) > time.time()
             }
+        bundle["dynamic_clients"] = self.export_dynamic_clients()
         if not hermes_root:
             hermes_root = Path.home() / ".hermes"
         return token_store.save_tokens(hermes_root, bundle)
@@ -429,6 +559,7 @@ class OAuthState:
                 if isinstance(item, dict) and item.get("expires_at", 0) > time.time():
                     store[value] = item
                     restored += 1
+        restored += self.import_dynamic_clients(bundle.get("dynamic_clients"))
         return {"restored": restored, "present": True}
 
 
@@ -528,6 +659,9 @@ class BearerAuthMiddleware:
         "/.well-known/openid-configuration",
         "/oauth/authorize",
         "/oauth/token",
+        # RFC 7591 dynamic client registration (public clients, redirect
+        # allowlist enforced inside the handler; see register_client).
+        "/oauth/register",
     }
 
     def __init__(self, app: ASGIApp, state: OAuthState | None = None, *, static_token: str | None = None) -> None:
@@ -609,9 +743,15 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
     params = request.query_params
     client_id = params.get("client_id", "")
     redirect_uri = params.get("redirect_uri", "")
-    if client_id != state.config.client_id:
+    dynamic = state.is_dynamic_client(client_id)
+    if not dynamic and client_id != state.config.client_id:
         return _error_response(OAuthError("invalid_client", "Unknown OAuth client.", status_code=401))
-    if not _redirect_uri_allowed(redirect_uri, state.config):
+    if dynamic:
+        if not state.client_redirect_allowed(client_id, redirect_uri):
+            return _error_response(
+                OAuthError("invalid_request", "redirect_uri is not registered for this client.")
+            )
+    elif not _redirect_uri_allowed(redirect_uri, state.config):
         return _error_response(OAuthError("invalid_request", "redirect_uri is not registered."))
     try:
         if params.get("response_type", "") != "code":
@@ -630,8 +770,14 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
         # authorize is accepted (the code is redeemed confidentially with the
         # client_secret at the token endpoint, see _authenticate_client), a
         # supplied challenge must still be valid S256, and method-without-
-        # challenge is rejected.
-        if state.config.pkce_mode == "optional":
+        # challenge is rejected. Dynamic (RFC 7591) clients are ALWAYS public
+        # clients: PKCE is mandatory regardless of mode.
+        if dynamic or state.config.pkce_mode != "optional":
+            if not challenge or method != "S256" or not _PKCE_VALUE.fullmatch(challenge):
+                raise OAuthError(
+                    "invalid_request", "A valid S256 code_challenge (PKCE) is required."
+                )
+        else:
             if challenge and (method != "S256" or not _PKCE_VALUE.fullmatch(challenge)):
                 raise OAuthError(
                     "invalid_request", "Only a valid S256 PKCE challenge is supported."
@@ -639,11 +785,6 @@ def authorize(request: Request, state: OAuthState) -> JSONResponse | RedirectRes
             if method and not challenge:
                 raise OAuthError(
                     "invalid_request", "code_challenge is required when a method is supplied."
-                )
-        else:
-            if not challenge or method != "S256" or not _PKCE_VALUE.fullmatch(challenge):
-                raise OAuthError(
-                    "invalid_request", "A valid S256 code_challenge (PKCE) is required."
                 )
         code = state.issue_authorization_code(
             client_id=client_id,
@@ -668,6 +809,61 @@ def _form_value(form: dict[str, list[str]], name: str) -> str:
     return values[0] if values else ""
 
 
+async def register_client(request: Request, state: OAuthState) -> JSONResponse:
+    """RFC 7591 dynamic client registration (public clients only).
+
+    2026-09-06 outage fix: OpenAI's platform calls POST /oauth/register and
+    then authorizes with the minted ephemeral client_id — both were 401
+    (endpoint absent / unknown client), bricking every headless re-auth.
+    Public clients only: no client secrets are ever issued; PKCE and the
+    chatgpt.com-family redirect allowlist are the binding controls.
+    """
+    try:
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise OAuthError("invalid_request", "Registration requests must use JSON.")
+        content_length = request.headers.get("content-length", "")
+        if content_length:
+            try:
+                if int(content_length) > _MAX_REGISTER_BYTES:
+                    raise OAuthError("invalid_request", "Registration request is too large.")
+            except ValueError as exc:
+                raise OAuthError("invalid_request", "Invalid Content-Length header.") from exc
+        buffered = bytearray()
+        async for chunk in request.stream():
+            if len(buffered) + len(chunk) > _MAX_REGISTER_BYTES:
+                raise OAuthError("invalid_request", "Registration request is too large.")
+            buffered.extend(chunk)
+        try:
+            payload = json.loads(bytes(buffered).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OAuthError("invalid_client_metadata", "Registration document is malformed.") from exc
+        if not isinstance(payload, dict):
+            raise OAuthError("invalid_client_metadata", "Registration document must be a JSON object.")
+        auth_method = payload.get("token_endpoint_auth_method", "none")
+        if auth_method != "none":
+            raise OAuthError(
+                "invalid_client_metadata",
+                "Only public clients (token_endpoint_auth_method=none) can register.",
+            )
+        grant_types = payload.get("grant_types", ["authorization_code", "refresh_token"])
+        if not isinstance(grant_types, list) or not set(grant_types).issubset(
+            {"authorization_code", "refresh_token"}
+        ):
+            raise OAuthError(
+                "invalid_client_metadata",
+                "Only authorization_code and refresh_token grants are supported.",
+            )
+        redirect_uris = payload.get("redirect_uris")
+        if not isinstance(redirect_uris, list):
+            raise OAuthError("invalid_redirect_uri", "redirect_uris must be a JSON array.")
+        client = state.register_dynamic_client(redirect_uris)
+        _run_persist_hook(state, "register_client")
+        return JSONResponse(client.as_public_dict(), status_code=201)
+    except OAuthError as exc:
+        return _error_response(exc)
+
+
 def _client_credentials(request: Request, form: dict[str, list[str]]) -> tuple[str, str]:
     authorization = request.headers.get("authorization", "")
     if authorization.lower().startswith("basic "):
@@ -690,11 +886,24 @@ def _authenticate_client(request: Request, form: dict[str, list[str]], state: OA
     for credential in (client_id, client_secret):
         if credential and not credential.isascii():
             raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=400)
+    grant_type = _form_value(form, "grant_type")
+    # RFC 7591 dynamic clients are public: authenticated by PKCE (code
+    # grants) or prior proof-of-possession (refresh grants). No secret path
+    # exists for them — a supplied secret never authenticates them.
+    if state.is_dynamic_client(client_id):
+        if client_secret:
+            raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
+        if grant_type == "refresh_token":
+            return client_id
+        if grant_type == "authorization_code" and _valid_pkce_verifier(
+            _form_value(form, "code_verifier")
+        ):
+            return client_id
+        raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
     if not hmac.compare_digest(
         client_id.encode("utf-8"), state.config.client_id.encode("utf-8")
     ):
         raise OAuthError("invalid_client", "Invalid OAuth client credentials.", status_code=401)
-    grant_type = _form_value(form, "grant_type")
     # Public PKCE clients (e.g. ChatGPT connectors) send no client_secret.
     # Secretless auth is only accepted for authorization_code grants that
     # carry a syntactically valid PKCE verifier — and that verifier is then
